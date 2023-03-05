@@ -1,0 +1,137 @@
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.WritableComparable;
+import org.apache.hadoop.io.WritableComparator;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.mapreduce.lib.partition.HashPartitioner;
+
+import java.io.IOException;
+import java.util.StringTokenizer;
+
+public class SecondarySort {
+    public static class SecondarySortMapper extends Mapper<Object, Text, Text, Text> {
+        private Text outKey = new Text();
+        private Text outValue = new Text();
+
+        @Override
+        protected void map(Object key, Text value, Context context) throws IOException, InterruptedException {
+            StringTokenizer stringTokenizer = new StringTokenizer(value.toString());
+            if(stringTokenizer.hasMoreTokens()) {
+                // 第一列和第二列共同作为 key，中间用制表符隔开，value为空即可
+                outKey.set(stringTokenizer.nextToken() + "\t" + stringTokenizer.nextToken());
+                context.write(outKey, outValue);
+            }
+        }
+    }
+
+    /**
+     * 使用自定义分区类决定将key发送给哪个Reducer结点进行处理
+     */
+    public static class SecondarySortPartition extends HashPartitioner<Text, Text> {
+        @Override
+        public int getPartition(Text key, Text value, int numReduceTasks) {
+            int key_first = Integer.parseInt(key.toString().split("\t")[0]);
+            // key是 1~100 的数，key的空间大小为100
+            if(key_first < 1) return 0; // not reachable
+            if(key_first > 100) return numReduceTasks - 1; // not reachable
+            int size = 100 / numReduceTasks; // 每一台机器处理的key值的数量
+            // 如果reducer过多size会成为0，key的空间大小为100，一台机器最少处理一个key
+            if(size == 0) {
+                size = 1;
+            }
+            // 根据key划分到不同的Reducer结点
+            return key_first / size;
+        }
+    }
+
+    /**
+     * 使用自定义类对key进行排序
+     * 对key的第一列进行升序，第二列进行降序
+     */
+    public static class SecondarySortCompare extends WritableComparator {
+        SecondarySortCompare() {
+            super(Text.class, true);
+        }
+
+        @Override
+        public int compare(WritableComparable a, WritableComparable b) {
+            String[] a_tokens = a.toString().split("\t");
+            String[] b_tokens = b.toString().split("\t");
+            int a_first = Integer.parseInt(a_tokens[0]);
+            int b_first = Integer.parseInt(b_tokens[0]);
+            // 先比较第一列，当第一列相等时比较第二列
+            if(a_first != b_first) {
+                return Integer.compare(a_first, b_first);
+            } else {
+                int a_second = Integer.parseInt(a_tokens[1]);
+                int b_second = Integer.parseInt(b_tokens[1]);
+                return Integer.compare(b_second, a_second);
+            }
+        }
+    }
+
+    /**
+     * 在分区之后使用自定义分组类决定将key发送给哪个reduce方法进行处理
+     * 由于key由两列组成，虽然使用分区将相同的key分配给相同的结点执行，但是Reducer结点会创建和不同key的数量相同的reduce方法处理不同的key，
+     * 为了减少reduce方法的执行次数，我们需要key第一列相同的键值对都由一个reduce方法执行，就需要GroupingComparator类将Reducer结点上的key进行分组。
+     */
+    public static class SecondaryGroupingComparator extends WritableComparator {
+        SecondaryGroupingComparator() {
+            super(Text.class, true);
+        }
+
+        @Override
+        public int compare(WritableComparable a, WritableComparable b) {
+            int a_first = Integer.parseInt(a.toString().split("\t")[0]);
+            int b_first = Integer.parseInt(b.toString().split("\t")[0]);
+            // key第一列相同的归为一组
+            return Integer.compare(a_first, b_first);
+        }
+    }
+
+    public static class SecondarySortReducer extends Reducer<Text, Text, Text, NullWritable> {
+        @Override
+        protected void reduce(Text key, Iterable<Text> values, Context context) throws IOException, InterruptedException {
+            // 对排好序的结果遍历输出即可
+            for(Text t : values) {
+                context.write(key, NullWritable.get());
+            }
+        }
+    }
+
+
+    public static void main(String[] args) throws Exception {
+        Configuration conf = new Configuration();
+        // 判断输出路径是否存在，如果存在，则删除
+        Path outputPath = new Path(args[1]);
+        outputPath.getFileSystem(conf).delete(outputPath, true);
+
+        // 创建一个任务并配置
+        Job job = Job.getInstance(conf, "SecondarySort");
+        job.setJarByClass(SecondarySort.class);
+        job.setMapperClass(SecondarySortMapper.class);
+        job.setPartitionerClass(SecondarySortPartition.class);
+        job.setSortComparatorClass(SecondarySortCompare.class);
+        job.setGroupingComparatorClass(SecondaryGroupingComparator.class);
+        job.setReducerClass(SecondarySortReducer.class);
+        job.setMapOutputKeyClass(Text.class);
+        job.setMapOutputValueClass(Text.class);
+        job.setOutputKeyClass(Text.class);
+        job.setOutputValueClass(NullWritable.class);
+
+        FileInputFormat.addInputPath(job, new Path(args[0]));
+        FileOutputFormat.setOutputPath(job, new Path(args[1]));
+
+        // 执行任务
+        System.exit(job.waitForCompletion(true) ? 0 : 1);
+    }
+}
+
+
+
